@@ -1,0 +1,6 @@
+pub Type:Package = {
+    name: "ngui-vulkan-server",
+    version: "0.1.0",
+    description: "Out-of-process Vulkan render server for NGUI",
+    authors: ["Randy <randy@example.com>"],
+};
