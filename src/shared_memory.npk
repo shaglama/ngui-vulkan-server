@@ -1,0 +1,107 @@
+use "syscall/syscall.npk".*;
+use "syscall/errno.npk".*;
+use "syscall/syscall_numbers.npk".*;
+use "syscall/posix_constants.npk".*;
+
+pub fixed int32:SOL_SOCKET = 1i32;
+pub fixed int32:SCM_RIGHTS = 1i32;
+
+// In Nitpick, complex structs for FFI/Syscalls are often mapped onto flat byte arrays or types. 
+// We will just create flat functions that build the msghdr on the stack exactly.
+
+// Helper to create an anonymous memory-backed file descriptor
+pub func:memfd_create = int32(int64:name_ptr, int64:flags) {
+    Result<int64>:res = sys_full(SYS_MEMFD_CREATE, name_ptr, flags, 0i64, 0i64, 0i64, 0i64);
+    if (res.is_error) { pass(-1i32); }
+    pass(cast_unchecked<int32>(res.value));
+};
+
+// Send an open file descriptor over a Unix domain socket
+pub func:send_fd = int32(int64:sock, int32:fd_to_send) {
+    // 1 byte dummy payload
+    stack uint8[1]:dummy;
+    dummy[0] = 0u8;
+
+    // struct iovec { void *iov_base; size_t iov_len; }
+    stack int64[2]:iov;
+    iov[0] = cast_unchecked<int64>(@dummy);
+    iov[1] = 1i64;
+
+    // struct cmsghdr { size_t cmsg_len; int cmsg_level; int cmsg_type; ... }
+    // We need 24 bytes total space.
+    // cmsg_len = 20, cmsg_level = 1, cmsg_type = 1, fd = fd_to_send, padding = 0
+    stack int64[3]:cmsg;
+    cmsg[0] = 20i64; // cmsg_len
+    
+    // cmsg_level (int) and cmsg_type (int) packed into one int64
+    // Little endian: lower 32 bits = cmsg_level, upper 32 bits = cmsg_type
+    cmsg[1] = cast_unchecked<int64>(SOL_SOCKET) | (cast_unchecked<int64>(SCM_RIGHTS) << 32i64);
+    
+    // fd (int) and padding (int) packed into one int64
+    cmsg[2] = cast_unchecked<int64>(fd_to_send);
+
+    // struct msghdr { void *msg_name; socklen_t msg_namelen; struct iovec *msg_iov; size_t msg_iovlen; void *msg_control; size_t msg_controllen; int msg_flags; }
+    // Size is 56 bytes.
+    // 0: msg_name (8 bytes)
+    // 8: msg_namelen + pad (8 bytes)
+    // 16: msg_iov (8 bytes)
+    // 24: msg_iovlen (8 bytes)
+    // 32: msg_control (8 bytes)
+    // 40: msg_controllen (8 bytes)
+    // 48: msg_flags + pad (8 bytes)
+    stack int64[7]:msg;
+    msg[0] = 0i64; // NULL
+    msg[1] = 0i64; // 0
+    msg[2] = cast_unchecked<int64>(@iov);
+    msg[3] = 1i64;
+    msg[4] = cast_unchecked<int64>(@cmsg);
+    msg[5] = 24i64; // CMSG_SPACE(sizeof(int))
+    msg[6] = 0i64;
+
+    // SYS_SENDMSG = 46
+    Result<int64>: res = sys_full(46i64, sock, cast_unchecked<int64>(@msg), 0i64, 0i64, 0i64, 0i64);
+    if (res.is_error) { pass(-1i32); }
+    pass(0i32);
+};
+
+// Receive an open file descriptor over a Unix domain socket
+pub func:recv_fd = int32(int64:sock) {
+    stack uint8[1]:dummy;
+
+    stack int64[2]:iov;
+    iov[0] = cast_unchecked<int64>(@dummy);
+    iov[1] = 1i64;
+
+    stack int64[3]:cmsg;
+    cmsg[0] = 0i64;
+    cmsg[1] = 0i64;
+    cmsg[2] = 0i64;
+
+    stack int64[7]:msg;
+    msg[0] = 0i64; // NULL
+    msg[1] = 0i64; // 0
+    msg[2] = cast_unchecked<int64>(@iov);
+    msg[3] = 1i64;
+    msg[4] = cast_unchecked<int64>(@cmsg);
+    msg[5] = 24i64; // CMSG_SPACE(sizeof(int))
+    msg[6] = 0i64;
+
+    // SYS_RECVMSG = 47
+    Result<int64>: res = sys_full(47i64, sock, cast_unchecked<int64>(@msg), 0i64, 0i64, 0i64, 0i64);
+    if (res.is_error) { pass(-1i32); }
+    
+    // Extract FD from cmsg if it matches
+    // cmsg[0] = cmsg_len. Should be >= 20.
+    if (cmsg[0] >= 20i64) {
+        int64: level_type = cmsg[1];
+        int32: level = cast_unchecked<int32>(level_type & 4294967295i64);
+        int32: ctype = cast_unchecked<int32>((level_type >> 32i64) & 4294967295i64);
+        
+        if (level == SOL_SOCKET && ctype == SCM_RIGHTS) {
+            int32: fd = cast_unchecked<int32>(cmsg[2] & 4294967295i64);
+            pass(fd);
+        }
+    }
+    
+    pass(-1i32); // No FD received
+};

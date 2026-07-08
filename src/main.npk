@@ -1,28 +1,249 @@
-use "nitpick_vulkan".Vulkan;
-use "libn/src/syscall/syscall.npk".*;
-use "libn/src/syscall/syscall_numbers.npk".*;
-use "libn/src/syscall/posix_constants.npk".*;
+
+extern "nitpick_vulkan_shim" {
+    func:nitpick_vk_init_window = int32(int32:width, int32:height, string:title);
+    func:nitpick_vk_begin_frame = void(flt32:r, flt32:g, flt32:b, flt32:a);
+    func:nitpick_vk_end_frame   = void();
+    func:nitpick_vk_poll_events = int32();
+    func:nitpick_vk_cleanup     = void();
+    func:nitpick_vk_load_shader = int32(int64:filename);
+    func:nitpick_vk_build_pipeline = int32(int32:vert_id, int32:frag_id);
+    func:nitpick_vk_buf_clear = void();
+    func:nitpick_vk_buf_push6 = void(flt32:a, flt32:b, flt32:c, flt32:d, flt32:e, flt32:f);
+    func:nitpick_vk_gen_buffer = int32();
+    func:nitpick_vk_upload_vertex_buffer = void(int32:id);
+    func:nitpick_vk_cmd_bind_pipeline = void(int32:id);
+    func:nitpick_vk_cmd_bind_vertex_buffer = void(int32:id);
+    func:nitpick_vk_draw = void(int32:count);
+}
+
+use "syscall/syscall.npk".*;
+use "syscall/syscall_numbers.npk".*;
+use "syscall/posix_constants.npk".*;
+// no print
+use "shared_memory.npk".*;
+use "str/strlen.npk".*;
+
+pub fixed int32:SOL_SOCKET = 1i32;
+pub fixed int32:SCM_RIGHTS = 1i32;
+
+pub struct:ServerState = {
+    flt32->: mapped_vbo;
+    int32: vbo_fd;
+};
 
 pub func:main = int32() {
-    // Scaffold basic server startup
-    Result<int32>:init_res = Vulkan.init_window(800i32, 600i32, "NGUI Vulkan Server");
-    if (init_res.is_error) {
-        // TODO: Handle error
-        pass(-1i32);
+
+    stack uint8[22]:sock_path;
+    sock_path[0] = 47u8; // /
+    sock_path[1] = 116u8; // t
+    sock_path[2] = 109u8; // m
+    sock_path[3] = 112u8; // p
+    sock_path[4] = 47u8; // /
+    sock_path[5] = 110u8; // n
+    sock_path[6] = 103u8; // g
+    sock_path[7] = 117u8; // u
+    sock_path[8] = 105u8; // i
+    sock_path[9] = 95u8; // _
+    sock_path[10] = 118u8; // v
+    sock_path[11] = 117u8; // u
+    sock_path[12] = 108u8; // l
+    sock_path[13] = 107u8; // k
+    sock_path[14] = 97u8; // a
+    sock_path[15] = 110u8; // n
+    sock_path[16] = 46u8; // .
+    sock_path[17] = 115u8; // s
+    sock_path[18] = 111u8; // o
+    sock_path[19] = 99u8; // c
+    sock_path[20] = 107u8; // k
+    sock_path[21] = 0u8;
+    
+    drop(sys_safe(SYS_UNLINKAT, AT_FDCWD, cast_unchecked<int64>(@sock_path), 0i64, 0i64, 0i64, 0i64));
+
+    print("Starting ngui-vulkan-server daemon...\n");
+    
+    // Create AF_UNIX SOCK_STREAM socket
+    Result<int64>:sock_res = sys_full3(SYS_SOCKET, AF_UNIX, SOCK_STREAM, 0i64);
+    if (sock_res.is_error) {
+        print("Failed to create socket\n");
+        exit(1i32);
+    }
+    int64:server_fd = sock_res.value;
+    
+    drop(sys_safe(SYS_UNLINKAT, AT_FDCWD, cast_unchecked<int64>("/tmp/ngui_vulkan.sock"), 0i64, 0i64, 0i64, 0i64));
+    
+    stack uint8[110]:addr;
+    addr[0] = 1u8; 
+    addr[1] = 0u8;
+    
+    int64:i = 0i64;
+    while (i < 21i64) {
+        addr[2i64 + i] = sock_path[i];
+        i = i + 1i64;
+    }
+    addr[2i64 + 21i64] = 0u8;
+    
+    Result<int64>:bind_res = sys_full3(SYS_BIND, server_fd, cast_unchecked<int64>(@addr), 110i64);
+    if (bind_res.is_error) {
+        print("Failed to bind socket\n");
+        exit(1i32);
     }
     
-    // Server loop
+    Result<int64>:listen_res = sys_full2(SYS_LISTEN, server_fd, 5i64);
+    if (listen_res.is_error) {
+        print("Failed to listen on socket\n");
+        exit(1i32);
+    }
+    
+    print("Listening on /tmp/ngui_vulkan.sock\n");
+    
     while (true) {
-        int32:events = Vulkan.poll_events().value;
-        if (events == 1i32) {
-            break; // Window closed
+        Result<int64>:accept_res = sys_full3(SYS_ACCEPT, server_fd, 0i64, 0i64);
+        if (accept_res.is_error) {
+            print("Failed to accept client\n");
+            continue;
+        }
+        int64:client_fd = accept_res.value;
+        print("Client connected!\n");
+        
+        ServerState:state;
+        state.vbo_fd = -1i32;
+        
+        bool:running = true;
+        while (running) {
+            stack int32[1]:cmd; cmd[0] = 0i32;
+            Result<int64>:read_res = libn_read_retry(client_fd, cast_unchecked<int64>(@cmd), 4i64);
+                if (read_res.is_error) { break; }
+                if (read_res.value == 0i64) { break; }
+            
+            if (cmd[0] == 1i32) {
+                // INIT_WINDOW
+                stack int32[2]:args; args[0] = 0i32; args[1] = 0i32;
+                drop(libn_read_retry(client_fd, cast_unchecked<int64>(@args), 8i64));
+                int32:init_res = nitpick_vk_init_window(args[0], args[1], "NGUI Vulkan Window");
+
+                stack int32[1]:resp;
+                resp[0] = init_res;
+                drop(libn_write_all(client_fd, cast_unchecked<int64>(@resp), 4i64));
+                
+            } else if (cmd[0] == 2i32) {
+                // BEGIN_FRAME
+                stack flt32[4]:args; args[0] = 0.0f32; args[1] = 0.0f32; args[2] = 0.0f32; args[3] = 0.0f32;
+                drop(libn_read_retry(client_fd, cast_unchecked<int64>(@args), 16i64));
+                drop(nitpick_vk_begin_frame(args[0], args[1], args[2], args[3]));
+                
+            } else if (cmd[0] == 3i32) {
+                // END_FRAME
+                drop(nitpick_vk_end_frame());
+                
+            } else if (cmd[0] == 4i32) {
+                // POLL_EVENTS
+                int32:events = nitpick_vk_poll_events();
+                stack int32[1]:resp;
+                resp[0] = events;
+                drop(libn_write_all(client_fd, cast_unchecked<int64>(@resp), 4i64));
+                
+            } else if (cmd[0] == 5i32) {
+                // CLEANUP
+                drop(nitpick_vk_cleanup());
+                running = false;
+                
+            } else if (cmd[0] == 6i32) {
+                // LOAD_SHADER
+                stack int32[2]:args; args[0] = 0i32; args[1] = 0i32;
+                stack uint8[1024]:path;
+                int32: shader_id = 0i32;
+                stack int32[1]:resp;
+                drop(libn_read_retry(client_fd, cast_unchecked<int64>(@args), 8i64));
+
+                drop(libn_read_retry(client_fd, cast_unchecked<int64>(@path), cast_unchecked<int64>(args[0])));
+                path[args[0]] = 0u8; // null terminate
+                
+                shader_id = nitpick_vk_load_shader(cast_unchecked<int64>(@path));
+                resp[0] = shader_id;
+                drop(libn_write_all(client_fd, cast_unchecked<int64>(@resp), 4i64));
+                
+            } else if (cmd[0] == 7i32) {
+                // BUILD_PIPELINE
+                stack int32[2]:args; args[0] = 0i32; args[1] = 0i32;
+                int32: pipeline_id = 0i32;
+                stack int32[1]:resp;
+                drop(libn_read_retry(client_fd, cast_unchecked<int64>(@args), 8i64));
+                pipeline_id = nitpick_vk_build_pipeline(args[0], args[1]);
+                resp[0] = pipeline_id;
+                drop(libn_write_all(client_fd, cast_unchecked<int64>(@resp), 4i64));
+                
+            } else if (cmd[0] == 8i32) {
+                // GEN_BUFFER_SHARED
+                Result<int32>: res_recv = recv_fd(client_fd);
+                if (res_recv.is_error == false) {
+                    state.vbo_fd = res_recv.value;
+                    Result<int64>: mmap_res = sys_safe(SYS_MMAP, 0i64, 1048576i64, PROT_READ, MAP_SHARED, cast_unchecked<int64>(state.vbo_fd), 0i64);
+                    if (mmap_res.is_error == false) {
+                        state.mapped_vbo = cast_unchecked<flt32->>(mmap_res.value);
+                    }
+                }
+                
+                int32: vbo_id = nitpick_vk_gen_buffer();
+                stack int32[1]:resp;
+                resp[0] = vbo_id;
+                drop(libn_write_all(client_fd, cast_unchecked<int64>(@resp), 4i64));
+                
+            } else if (cmd[0] == 9i32) {
+                // UPLOAD_VERTICES
+                stack int32[2]:args; args[0] = 0i32; args[1] = 0i32; // id, float_count
+                drop(libn_read_retry(client_fd, cast_unchecked<int64>(@args), 8i64));
+                
+                drop(nitpick_vk_buf_clear());
+                
+                int32: count = args[1];
+                int32: i = 0i32;
+                while (i < count) {
+                    int64: idx = cast_unchecked<int64>(i);
+                    flt32: a = state.mapped_vbo[idx];
+                    flt32: b = state.mapped_vbo[idx + 1i64];
+                    flt32: c = state.mapped_vbo[idx + 2i64];
+                    flt32: d = state.mapped_vbo[idx + 3i64];
+                    flt32: e = state.mapped_vbo[idx + 4i64];
+                    flt32: f = state.mapped_vbo[idx + 5i64];
+                    drop(nitpick_vk_buf_push6(a, b, c, d, e, f));
+                    i = i + 6i32;
+                }
+                drop(nitpick_vk_upload_vertex_buffer(args[0]));
+                
+            } else if (cmd[0] == 10i32) {
+                // CMD_BIND_PIPELINE
+                stack int32[1]:args; args[0] = 0i32;
+                drop(libn_read_retry(client_fd, cast_unchecked<int64>(@args), 4i64));
+                drop(nitpick_vk_cmd_bind_pipeline(args[0]));
+                
+            } else if (cmd[0] == 11i32) {
+                // CMD_BIND_VERTEX_BUFFER
+                stack int32[1]:args; args[0] = 0i32;
+                drop(libn_read_retry(client_fd, cast_unchecked<int64>(@args), 4i64));
+                drop(nitpick_vk_cmd_bind_vertex_buffer(args[0]));
+                
+            } else if (cmd[0] == 12i32) {
+                // DRAW
+                stack int32[1]:args; args[0] = 0i32;
+                drop(libn_read_retry(client_fd, cast_unchecked<int64>(@args), 4i64));
+                drop(nitpick_vk_draw(args[0]));
+            }
         }
         
-        // Render dummy frame (blue clear color)
-        Vulkan.begin_frame(0.1f32, 0.2f32, 0.8f32, 1.0f32);
-        Vulkan.end_frame();
+        drop(sys_safe(SYS_CLOSE, client_fd, 0i64, 0i64, 0i64, 0i64, 0i64));
     }
     
-    Vulkan.cleanup();
-    pass(0i32);
+    drop(sys_safe(SYS_CLOSE, server_fd, 0i64, 0i64, 0i64, 0i64, 0i64));
+    drop(sys_safe(SYS_UNLINKAT, AT_FDCWD, cast_unchecked<int64>(@sock_path), 0i64, 0i64, 0i64, 0i64));
+    exit(0i32);
+};
+
+pub func:print = NIL(string:msg) {
+    int64: length = raw str_strlen(cast_unchecked<int64>(msg));
+    drop(sys_safe(SYS_WRITE, 1i64, cast_unchecked<int64>(msg), length, 0i64, 0i64, 0i64));
+    pass NIL;
+};
+pub func:failsafe = int32(tbb32:err) {
+    print("Failsafe triggered\n");
+    exit(1i32);
 };

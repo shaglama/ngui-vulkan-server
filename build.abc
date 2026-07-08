@@ -1,10 +1,9 @@
-{
-    "name": "ngui_vulkan_server",
-    "version": "0.1.0",
-    "type": "executable",
-    "main": "src/main.npk",
-    "dependencies": {
-        "nitpick_vulkan": "../nitpick-packages/packages/nitpick-vulkan",
-        "libn": "../libn"
-    }
-}
+[project]
+name = "ngui_vulkan_server"
+version = "0.1.0"
+
+[target.main]
+type = "executable"
+sources = ["src/main.npk"]
+flags = ["-I", "../libn/src", "-I", "src", "-I", "../nitpick-packages/packages/nitpick-vulkan/src", "-L", "../nitpick-packages/packages/nitpick-vulkan/shim", "-lnitpick_vulkan_shim", "-lSDL2", "-lvulkan"]
+
